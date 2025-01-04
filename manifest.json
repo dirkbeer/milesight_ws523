@@ -2,7 +2,7 @@
     "domain": "milesight_ws523",
     "name": "Milesight WS523 Smart Plug",
     "config_flow": true,
-    "documentation": "https://github.com/dirkbeer/ha-milesight-ws523",
+    "documentation": "https://github.com/dirkbeer/milesight_ws523",
     "homeassistant": "2024.1.0",
     "dependencies": ["mqtt"],
     "codeowners": [],
