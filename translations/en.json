@@ -1,0 +1,7 @@
+{
+    "config": {
+        "error": {
+            "invalid_device_eui": "Invalid Device EUI format. Must be 16 hexadecimal characters."
+        }
+    }
+}
