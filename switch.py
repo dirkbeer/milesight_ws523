@@ -5,6 +5,7 @@ import json
 import logging
 from typing import Any, Dict, Optional
 import functools
+import random
 
 import voluptuous as vol
 
@@ -43,6 +44,11 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# Constants for exponential backoff
+INITIAL_BACKOFF = 5  # Initial backoff in seconds
+MAX_BACKOFF = 300   # Maximum backoff in seconds (5 minutes)
+MAX_RETRIES = None  # None means infinite retries
+
 async def async_setup_entry(
     hass: HomeAssistant,
     config_entry: ConfigEntry,
@@ -67,6 +73,8 @@ class WS523Device(SwitchEntity, RestoreEntity):
         self._attr_name = f"WS523 Smart Plug {device_eui[-4:]}"
         self._state = None
         self._available = False
+        self._retry_count = 0
+        self._retry_task = None
         self._attributes = {
             ATTR_VOLTAGE: None,
             ATTR_CURRENT: None,
@@ -75,7 +83,6 @@ class WS523Device(SwitchEntity, RestoreEntity):
             ATTR_POWER_FACTOR: None,
         }
 
-        # Make entity suitable for dashboards
         self._attr_has_entity_name = True
         self._attr_name = "Switch"
         self.entity_id = f"switch.ws523_{device_eui}"
@@ -88,6 +95,47 @@ class WS523Device(SwitchEntity, RestoreEntity):
             sw_version="1.0",
         )
 
+    def _calculate_backoff(self) -> float:
+        """Calculate the exponential backoff time with jitter."""
+        backoff = min(INITIAL_BACKOFF * (2 ** self._retry_count), MAX_BACKOFF)
+        # Add random jitter of ±15%
+        jitter = backoff * 0.3 * (random.random() - 0.5)
+        return backoff + jitter
+
+    async def _connect_mqtt(self) -> bool:
+        """Attempt to connect to MQTT and subscribe to topics."""
+        try:
+            await mqtt.async_subscribe(
+                self.hass,
+                f"chirpstack/{self._device_eui}/upChannel",
+                self._message_received_callback,
+                qos=self._qos,
+            )
+            # Send initial status query
+            command = base64.b64encode(bytes.fromhex("ff28ff")).decode()
+            await self._publish_command(command)
+            self._available = True
+            self._retry_count = 0  # Reset retry count on successful connection
+            return True
+        except Exception as e:
+            _LOGGER.error("Failed to connect to MQTT (attempt %d): %s", self._retry_count + 1, e)
+            return False
+
+    async def _retry_connection(self) -> None:
+        """Implement exponential backoff retry logic."""
+        while MAX_RETRIES is None or self._retry_count < MAX_RETRIES:
+            if await self._connect_mqtt():
+                _LOGGER.info("Successfully connected to MQTT after %d retries", self._retry_count)
+                return
+
+            self._retry_count += 1
+            backoff = self._calculate_backoff()
+            _LOGGER.info("Retrying MQTT connection in %.1f seconds (attempt %d)", 
+                        backoff, self._retry_count + 1)
+            await asyncio.sleep(backoff)
+
+        _LOGGER.error("Failed to connect to MQTT after maximum retries")
+
     async def async_added_to_hass(self) -> None:
         """Handle entity about to be added to hass."""
         # Restore previous state using RestoreEntity
@@ -99,35 +147,21 @@ class WS523Device(SwitchEntity, RestoreEntity):
                     if key in last_state.attributes:
                         self._attributes[key] = last_state.attributes[key]
         
-        # Set up MQTT subscription
-        try:
-            await mqtt.async_subscribe(
-                self.hass,
-                f"chirpstack/{self._device_eui}/upChannel",
-                self._message_received_callback,
-                qos=self._qos,
-            )
-        except Exception as e:
-            _LOGGER.error("Failed to subscribe to MQTT: %s", e)
-            self._available = False
-            # Schedule retry in 30 seconds
-            self.hass.async_create_task(self._retry_connection())
-            return
-        
-        # Send initial status query
-        command = base64.b64encode(bytes.fromhex("ff28ff")).decode()
-        await self._publish_command(command)
-        
-        # Set available after successful setup
-        self._available = True
+        # Start initial connection attempt
+        if not await self._connect_mqtt():
+            self._retry_task = asyncio.create_task(self._retry_connection())
 
-    async def _retry_connection(self):
-        """Retry MQTT connection."""
-        await asyncio.sleep(30)
-        await self.async_added_to_hass()
+    async def async_will_remove_from_hass(self) -> None:
+        """Clean up when entity is removed."""
+        if self._retry_task is not None:
+            self._retry_task.cancel()
+            try:
+                await self._retry_task
+            except asyncio.CancelledError:
+                pass
 
     def _message_received_callback(self, msg) -> None:
-        """Handle received MQTT message by scheduling it in the event loop."""
+        """Handle received MQTT message."""
         self.hass.add_job(self._handle_message, msg)
 
     async def _handle_message(self, msg) -> None:
@@ -144,16 +178,13 @@ class WS523Device(SwitchEntity, RestoreEntity):
                 
             data = payload["decoded"]["payload"]
             
-            # Update switch state
             if "socket_status" in data:
                 new_state = data["socket_status"] == "open"
-                if self._state != new_state:  # Only if state actually changed
+                if self._state != new_state:
                     self._state = new_state
-                    # Request sensor data immediately after state confirmation
                     command = base64.b64encode(bytes.fromhex("ff28ff")).decode()
                     await self._publish_command(command)
             
-            # Update measurements
             for attr_key, data_key in [
                 (ATTR_VOLTAGE, "voltage"),
                 (ATTR_CURRENT, "current"),
@@ -164,13 +195,10 @@ class WS523Device(SwitchEntity, RestoreEntity):
                 if data_key in data:
                     self._attributes[attr_key] = data[data_key]
             
-            # Update sensor entities using the stored references
             if (DOMAIN in self.hass.data and 
                 "sensors" in self.hass.data[DOMAIN] and 
                 self._device_eui in self.hass.data[DOMAIN]["sensors"]):
                 sensors = self.hass.data[DOMAIN]["sensors"][self._device_eui]
-                
-                # Update each sensor if we have data for it
                 for value_key, value in data.items():
                     if value_key in sensors:
                         sensors[value_key].update_from_data(value)
@@ -210,15 +238,21 @@ class WS523Device(SwitchEntity, RestoreEntity):
 
     async def _publish_command(self, command: str) -> None:
         """Publish command to MQTT."""
-        payload = {
-            "payload_raw": command,
-            "port": 85,
-            "confirmed": True
-        }
-        topic = f"chirpstack/{self._device_eui}/dnChannel"
-        await mqtt.async_publish(
-            self.hass, 
-            topic, 
-            json.dumps(payload),
-            qos=self._qos
-        )
+        try:
+            payload = {
+                "payload_raw": command,
+                "port": 85,
+                "confirmed": True
+            }
+            topic = f"chirpstack/{self._device_eui}/dnChannel"
+            await mqtt.async_publish(
+                self.hass, 
+                topic, 
+                json.dumps(payload),
+                qos=self._qos
+            )
+        except Exception as e:
+            _LOGGER.error("Failed to publish MQTT command: %s", e)
+            self._available = False
+            if self._retry_task is None or self._retry_task.done():
+                self._retry_task = asyncio.create_task(self._retry_connection())
