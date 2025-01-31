@@ -1,0 +1,25 @@
+name: Combine Integration Files
+
+on: [push]
+
+jobs:
+  combine-files:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Run combiner script
+      run: |
+        python combiner.py
+
+    - name: Upload combined file
+      uses: actions/upload-artifact@v3
+      with:
+        name: combined_code
+        path: combined_code.txt
