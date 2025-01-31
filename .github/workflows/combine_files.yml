@@ -15,11 +15,10 @@ jobs:
         python-version: '3.10'
 
     - name: Run combiner script
-      run: |
-        python combiner.py
+      run: python combiner.py
 
     - name: Upload combined file
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: combined_code
         path: combined_code.txt
