@@ -15,7 +15,7 @@ jobs:
         python-version: '3.10'
 
     - name: Run combiner script
-      run: python combiner.py
+      run: python .github/workflows/combiner.py
 
     - name: Upload combined file
       uses: actions/upload-artifact@v4
